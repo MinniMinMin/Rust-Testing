@@ -1,12 +1,42 @@
+use std::cmp;
+
+use rand::Rng;
 use tcod::colors::*;
 use tcod::console::*;
-use std::cmp;
-use rand::Rng;
+use tcod::input::{self, Event, Key, Mouse};
 use tcod::map::{FovAlgorithm, Map as FovMap};
+
+// actual size of the window
+const SCREEN_WIDTH: i32 = 80;
+const SCREEN_HEIGHT: i32 = 50;
+
+// size of the map
+const MAP_WIDTH: i32 = 80;
+const MAP_HEIGHT: i32 = 43;
+
+// sizes and coordinates relevant for the GUI
+const BAR_WIDTH: i32 = 20;
+const PANEL_HEIGHT: i32 = 7;
+const PANEL_Y: i32 = SCREEN_HEIGHT - PANEL_HEIGHT;
+const MSG_X: i32 = BAR_WIDTH + 2;
+const MSG_WIDTH: i32 = SCREEN_WIDTH - BAR_WIDTH - 2;
+const MSG_HEIGHT: usize = PANEL_HEIGHT as usize - 1;
+const INVENTORY_WIDTH: i32 = 50;
+
+//parameters for dungeon generator
+const ROOM_MAX_SIZE: i32 = 10;
+const ROOM_MIN_SIZE: i32 = 6;
+const MAX_ROOMS: i32 = 30;
+const MAX_ROOM_MONSTERS: i32 = 3;
+const MAX_ROOM_ITEMS: i32 = 2;
+
+const HEAL_AMOUNT: i32 = 4;
 
 const FOV_ALGO: FovAlgorithm = FovAlgorithm::Basic; // default FOV algorithm
 const FOV_LIGHT_WALLS: bool = true; // light walls or not
 const TORCH_RADIUS: i32 = 10;
+
+const LIMIT_FPS: i32 = 20; // 20 frames-per-second maximum
 
 const COLOR_DARK_WALL: Color = Color { r: 0, g: 0, b: 100 };
 const COLOR_LIGHT_WALL: Color = Color {
@@ -25,56 +55,47 @@ const COLOR_LIGHT_GROUND: Color = Color {
     b: 50,
 };
 
-// actual size of the window
-const SCREEN_WIDTH: i32 = 80;
-const SCREEN_HEIGHT: i32 = 50;
-
-// size of the map
-const MAP_WIDTH: i32 = 80;
-const MAP_HEIGHT: i32 = 45;
-
-//parameters for dungeon generator
-const ROOM_MAX_SIZE: i32 = 10;
-const ROOM_MIN_SIZE: i32 = 6;
-const MAX_ROOMS: i32 = 30;
-
-const LIMIT_FPS: i32 = 20; // 20 frames-per-second maximum
+// player will always be the first Entity
+const PLAYER: usize = 0;
 
 struct Tcod {
     root: Root,
     con: Offscreen,
+    panel: Offscreen,
     fov: FovMap,
+    key: Key,
+    mouse: Mouse,
 }
 
-// any entity such as player, monster etc
-struct Entity {
-    x: i32,
-    y: i32,
-    char: char,
-    colour: Color,
+type Map = Vec<Vec<Tile>>;
+
+struct Messages {
+    messages: Vec<(String, Color)>,
 }
 
-impl Entity {
-    pub fn new(x: i32, y: i32, char: char, colour: Color) -> Self {
-        Entity {x, y, char, colour}
+impl Messages {
+    pub fn new() -> Self {
+        Self { messages: vec![] }
     }
 
-    // move by the given amount, if the destination is not blocked
-    pub fn move_by(&mut self, dx: i32, dy: i32, game: &Game) {  
-        if !game.map[(self.x + dx) as usize][(self.y + dy) as usize].blocked {  
-            self.x += dx;  
-            self.y += dy;
-        }
+    /// add the new message as a tuple, with the text and the color
+    pub fn add<T: Into<String>>(&mut self, message: T, color: Color) {
+        self.messages.push((message.into(), color));
     }
 
-    // set the color and then draw the character that represents this entity     at its position
-    pub fn draw(&self, con: &mut dyn Console) {
-        con.set_default_foreground(self.colour);
-        con.put_char(self.x, self.y, self.char, BackgroundFlag::None);
+    /// Create a `DoubleEndedIterator` over the messages
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &(String, Color)> {
+        self.messages.iter()
     }
 }
 
-// A tile of the map and its properties
+struct Game {
+    map: Map,
+    messages: Messages,
+    inventory: Vec<Entity>,
+}
+
+/// A tile of the map and its properties
 #[derive(Clone, Copy, Debug)]
 struct Tile {
     blocked: bool,
@@ -98,12 +119,6 @@ impl Tile {
             block_sight: true,
         }
     }
-}
-
-type Map = Vec<Vec<Tile>>;
-
-struct Game {
-    map: Map,
 }
 
 /// A rectangle on the map, used to characterise a room.
@@ -130,7 +145,7 @@ impl Rect {
         let center_y = (self.y1 + self.y2) / 2;
         (center_x, center_y)
     }
-    
+
     pub fn intersects_with(&self, other: &Rect) -> bool {
         // returns true if this rectangle intersects with another one
         (self.x1 <= other.x2)
@@ -140,104 +155,300 @@ impl Rect {
     }
 }
 
-fn main() {
-    tcod::system::set_fps(LIMIT_FPS);
+/// This is a generic Entity: the player, a monster, an item, the stairs...
+/// It's always represented by a character on screen.
+#[derive(Debug)]
+struct Entity {
+    x: i32,
+    y: i32,
+    char: char,
+    color: Color,
+    name: String,
+    blocks: bool,
+    alive: bool,
+    fighter: Option<Fighter>,
+    ai: Option<Ai>,
+    item: Option<Item>,
+}
 
-    let root = Root::initializer()
-        .font("images/arial10x10.png", FontLayout::Tcod)
-        .font_type(FontType::Greyscale)
-        .size(SCREEN_WIDTH, SCREEN_HEIGHT)
-        .title("Rust/libtcod tutorial")
-        .init();
+impl Entity {
+    pub fn new(x: i32, y: i32, char: char, name: &str, color: Color, blocks: bool) -> Self {
+        Entity {
+            x: x,
+            y: y,
+            char: char,
+            color: color,
+            name: name.into(),
+            blocks: blocks,
+            alive: false,
+            fighter: None,
+            ai: None,
+            item: None,
+        }
+    }
 
-    let mut tcod = Tcod {
-        root,
-        con: Offscreen::new(MAP_WIDTH, MAP_HEIGHT),  
-        fov: FovMap::new(MAP_WIDTH, MAP_HEIGHT),  
-    };
+    /// set the color and then draw the character that represents this Entity at its position
+    pub fn draw(&self, con: &mut dyn Console) {
+        con.set_default_foreground(self.color);
+        con.put_char(self.x, self.y, self.char, BackgroundFlag::None);
+    }
 
-    // create player
-    let player = Entity::new(0, 0, '@', WHITE);
+    pub fn pos(&self) -> (i32, i32) {
+        (self.x, self.y)
+    }
 
-    // create an NPC
-    let npc = Entity::new(SCREEN_WIDTH / 2 - 5, SCREEN_HEIGHT / 2, '@', YELLOW);
+    pub fn set_pos(&mut self, x: i32, y: i32) {
+        self.x = x;
+        self.y = y;
+    }
 
-    // the list of entities with those two
-    let mut entities = [player, npc];
+    /// return the distance to another Entity
+    pub fn distance_to(&self, other: &Entity) -> f32 {
+        let dx = other.x - self.x;
+        let dy = other.y - self.y;
+        ((dx.pow(2) + dy.pow(2)) as f32).sqrt()
+    }
 
-    let mut game = Game {
-        // generate map (at this point it's not drawn to the screen)
-        map: make_map(&mut entities[0]),
-    };
+    pub fn take_damage(&mut self, damage: i32, game: &mut Game) {
+        // apply damage if possible
+        if let Some(fighter) = self.fighter.as_mut() {
+            if damage > 0 {
+                fighter.hp -= damage;
+            }
+        }
+        // check for death, call the death function
+        if let Some(fighter) = self.fighter {
+            if fighter.hp <= 0 {
+                self.alive = false;
+                fighter.on_death.callback(self, game);
+            }
+        }
+    }
 
-    // populate the FOV map, according to the generated map
-    for y in 0..MAP_HEIGHT {
-        for x in 0..MAP_WIDTH {
-            tcod.fov.set(
-                x,
-                y,
-                !game.map[x as usize][y as usize].block_sight,
-                !game.map[x as usize][y as usize].blocked,
+    pub fn attack(&mut self, target: &mut Entity, game: &mut Game) {
+        // a simple formula for attack damage
+        let damage = self.fighter.map_or(0, |f| f.power) - target.fighter.map_or(0, |f| f.defense);
+        if damage > 0 {
+            // make the target take some damage
+            game.messages.add(
+                format!(
+                    "{} attacks {} for {} hit points.",
+                    self.name, target.name, damage
+                ),
+                WHITE,
+            );
+            target.take_damage(damage, game);
+        } else {
+            game.messages.add(
+                format!(
+                    "{} attacks {} but it has no effect!",
+                    self.name, target.name
+                ),
+                WHITE,
             );
         }
     }
 
-    // force FOV "recompute" first time through the game loop
-    let mut previous_player_position = (-1, -1);
-
-    while !tcod.root.window_closed() {
-        // clean the previous frame
-        tcod.con.clear();
-
-        // render the screen
-        let fov_recompute = previous_player_position != (entities[0].x, entities[0].y);
-        render_all(&mut tcod, &mut game, &entities, fov_recompute);
-
-        tcod.root.flush(); 
-
-        // handle keys and exit game if needed
-        let player = &mut entities[0];
-        previous_player_position = (player.x, player.y);
-        let exit = handle_keys(&mut tcod, &game, player);
-
-        if exit {
-            break;
+    /// heal by the given amount, without going over the maximum
+    pub fn heal(&mut self, amount: i32) {
+        if let Some(ref mut fighter) = self.fighter {
+            fighter.hp += amount;
+            if fighter.hp > fighter.max_hp {
+                fighter.hp = fighter.max_hp;
+            }
         }
-
     }
 }
 
-fn handle_keys(tcod: &mut Tcod, game: &Game, player: &mut Entity) -> bool {
-    use tcod::input::Key;
-    use tcod::input::KeyCode::*;
-
-    let key = tcod.root.wait_for_keypress(true);
-    match key {
-        Key {
-            code: Enter,
-            alt: true,
-            ..
-        } => {
-            // Alt+Enter: toggle fullscreen
-            let fullscreen = tcod.root.is_fullscreen();
-            tcod.root.set_fullscreen(!fullscreen);
-        }
-
-        Key { code: Escape, .. } => return true, // exit game
-
-        // movement keys
-        Key { code: Up, .. } => player.move_by(0, -1, game),
-        Key { code: Down, .. } => player.move_by(0, 1, game),
-        Key { code: Left, .. } => player.move_by(-1, 0, game),
-        Key { code: Right, .. } => player.move_by(1, 0, game),
-
-        _ => {}
+/// move by the given amount, if the destination is not blocked
+fn move_by(id: usize, dx: i32, dy: i32, map: &Map, entities: &mut [Entity]) {
+    let (x, y) = entities[id].pos();
+    if !is_blocked(x + dx, y + dy, map, entities) {
+        entities[id].set_pos(x + dx, y + dy);
     }
-
-    false
 }
 
-fn make_map(player: &mut Entity) -> Map {
+fn move_towards(id: usize, target_x: i32, target_y: i32, map: &Map, entities: &mut [Entity]) {
+    // vector from this Entity to the target, and distance
+    let dx = target_x - entities[id].x;
+    let dy = target_y - entities[id].y;
+    let distance = ((dx.pow(2) + dy.pow(2)) as f32).sqrt();
+
+    // normalize it to length 1 (preserving direction), then round it and
+    // convert to integer so the movement is restricted to the map grid
+    let dx = (dx as f32 / distance).round() as i32;
+    let dy = (dy as f32 / distance).round() as i32;
+    move_by(id, dx, dy, map, entities);
+}
+
+/// Mutably borrow two *separate* elements from the given slice.
+/// Panics when the indexes are equal or out of bounds.
+fn mut_two<T>(first_index: usize, second_index: usize, items: &mut [T]) -> (&mut T, &mut T) {
+    assert!(first_index != second_index);
+    let split_at_index = cmp::max(first_index, second_index);
+    let (first_slice, second_slice) = items.split_at_mut(split_at_index);
+    if first_index < second_index {
+        (&mut first_slice[first_index], &mut second_slice[0])
+    } else {
+        (&mut second_slice[0], &mut first_slice[second_index])
+    }
+}
+
+/// add to the player's inventory and remove from the map
+fn pick_item_up(Entity_id: usize, game: &mut Game, entities: &mut Vec<Entity>) {
+    if game.inventory.len() >= 26 {
+        game.messages.add(
+            format!(
+                "Your inventory is full, cannot pick up {}.",
+                entities[Entity_id].name
+            ),
+            RED,
+        );
+    } else {
+        let item = entities.swap_remove(Entity_id);
+        game.messages
+            .add(format!("You picked up a {}!", item.name), GREEN);
+        game.inventory.push(item);
+    }
+}
+
+fn is_blocked(x: i32, y: i32, map: &Map, entities: &[Entity]) -> bool {
+    // first test the map tile
+    if map[x as usize][y as usize].blocked {
+        return true;
+    }
+    // now check for any blocking entities
+    entities
+        .iter()
+        .any(|Entity| Entity.blocks && Entity.pos() == (x, y))
+}
+
+// combat-related properties and methods (monster, player, NPC).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Fighter {
+    max_hp: i32,
+    hp: i32,
+    defense: i32,
+    power: i32,
+    on_death: DeathCallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DeathCallback {
+    Player,
+    Monster,
+}
+
+impl DeathCallback {
+    fn callback(self, Entity: &mut Entity, game: &mut Game) {
+        use DeathCallback::*;
+        let callback = match self {
+            Player => player_death,
+            Monster => monster_death,
+        };
+        callback(Entity, game);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Ai {
+    Basic,
+}
+
+fn ai_take_turn(monster_id: usize, tcod: &Tcod, game: &mut Game, entities: &mut [Entity]) {
+    // a basic monster takes its turn. If you can see it, it can see you
+    let (monster_x, monster_y) = entities[monster_id].pos();
+    if tcod.fov.is_in_fov(monster_x, monster_y) {
+        if entities[monster_id].distance_to(&entities[PLAYER]) >= 2.0 {
+            // move towards player if far away
+            let (player_x, player_y) = entities[PLAYER].pos();
+            move_towards(monster_id, player_x, player_y, &game.map, entities);
+        } else if entities[PLAYER].fighter.map_or(false, |f| f.hp > 0) {
+            // close enough, attack! (if the player is still alive.)
+            let (monster, player) = mut_two(monster_id, PLAYER, entities);
+            monster.attack(player, game);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Item {
+    Heal,
+}
+
+enum UseResult {
+    UsedUp,
+    Cancelled,
+}
+
+fn use_item(inventory_id: usize, tcod: &mut Tcod, game: &mut Game, entities: &mut [Entity]) {
+    use Item::*;
+    // just call the "use_function" if it is defined
+    if let Some(item) = game.inventory[inventory_id].item {
+        let on_use = match item {
+            Heal => cast_heal,
+        };
+        match on_use(inventory_id, tcod, game, entities) {
+            UseResult::UsedUp => {
+                // destroy after use, unless it was cancelled for some reason
+                game.inventory.remove(inventory_id);
+            }
+            UseResult::Cancelled => {
+                game.messages.add("Cancelled", WHITE);
+            }
+        }
+    } else {
+        game.messages.add(
+            format!("The {} cannot be used.", game.inventory[inventory_id].name),
+            WHITE,
+        );
+    }
+}
+
+fn cast_heal(
+    _inventory_id: usize,
+    _tcod: &mut Tcod,
+    game: &mut Game,
+    entities: &mut [Entity],
+) -> UseResult {
+    // heal the player
+    if let Some(fighter) = entities[PLAYER].fighter {
+        if fighter.hp == fighter.max_hp {
+            game.messages.add("You are already at full health.", RED);
+            return UseResult::Cancelled;
+        }
+        game.messages
+            .add("Your wounds start to feel better!", LIGHT_VIOLET);
+        entities[PLAYER].heal(HEAL_AMOUNT);
+        return UseResult::UsedUp;
+    }
+    UseResult::Cancelled
+}
+
+fn create_room(room: Rect, map: &mut Map) {
+    // go through the tiles in the rectangle and make them passable
+    for x in (room.x1 + 1)..room.x2 {
+        for y in (room.y1 + 1)..room.y2 {
+            map[x as usize][y as usize] = Tile::empty();
+        }
+    }
+}
+
+fn create_h_tunnel(x1: i32, x2: i32, y: i32, map: &mut Map) {
+    // horizontal tunnel. `min()` and `max()` are used in case `x1 > x2`
+    for x in cmp::min(x1, x2)..(cmp::max(x1, x2) + 1) {
+        map[x as usize][y as usize] = Tile::empty();
+    }
+}
+
+fn create_v_tunnel(y1: i32, y2: i32, x: i32, map: &mut Map) {
+    // vertical tunnel
+    for y in cmp::min(y1, y2)..(cmp::max(y1, y2) + 1) {
+        map[x as usize][y as usize] = Tile::empty();
+    }
+}
+
+fn make_map(entities: &mut Vec<Entity>) -> Map {
     // fill map with "blocked" tiles
     let mut map = vec![vec![Tile::wall(); MAP_HEIGHT as usize]; MAP_WIDTH as usize];
 
@@ -264,13 +475,15 @@ fn make_map(player: &mut Entity) -> Map {
             // "paint" it to the map's tiles
             create_room(new_room, &mut map);
 
+            // add some content to this room, such as monsters
+            place_entities(new_room, &map, entities);
+
             // center coordinates of the new room, will be useful later
             let (new_x, new_y) = new_room.center();
 
             if rooms.is_empty() {
                 // this is the first room, where the player starts at
-                player.x = new_x;
-                player.y = new_y;
+                entities[PLAYER].set_pos(new_x, new_y);
             } else {
                 // all rooms after the first:
                 // connect it to the previous room with a tunnel
@@ -298,15 +511,123 @@ fn make_map(player: &mut Entity) -> Map {
     map
 }
 
-fn render_all(tcod: &mut Tcod, game: &mut Game, entities: &[Entity], fov_recompute: bool) {
+fn place_entities(room: Rect, map: &Map, entities: &mut Vec<Entity>) {
+    // choose random number of monsters
+    let num_monsters = rand::thread_rng().gen_range(0, MAX_ROOM_MONSTERS + 1);
 
+    for _ in 0..num_monsters {
+        // choose random spot for this monster
+        let x = rand::thread_rng().gen_range(room.x1 + 1, room.x2);
+        let y = rand::thread_rng().gen_range(room.y1 + 1, room.y2);
+
+        // only place it if the tile is not blocked
+        if !is_blocked(x, y, map, entities) {
+            let mut monster = if rand::random::<f32>() < 0.8 {
+                // 80% chance of getting an orc
+                // create an orc
+                let mut orc = Entity::new(x, y, 'o', "orc", DESATURATED_GREEN, true);
+                orc.fighter = Some(Fighter {
+                    max_hp: 10,
+                    hp: 10,
+                    defense: 0,
+                    power: 3,
+                    on_death: DeathCallback::Monster,
+                });
+                orc.ai = Some(Ai::Basic);
+                orc
+            } else {
+                // create a troll
+                let mut troll = Entity::new(x, y, 'T', "troll", DARKER_GREEN, true);
+                troll.fighter = Some(Fighter {
+                    max_hp: 16,
+                    hp: 16,
+                    defense: 1,
+                    power: 4,
+                    on_death: DeathCallback::Monster,
+                });
+                troll.ai = Some(Ai::Basic);
+                troll
+            };
+            monster.alive = true;
+            entities.push(monster);
+        }
+    }
+
+    // choose random number of items
+    let num_items = rand::thread_rng().gen_range(0, MAX_ROOM_ITEMS + 1);
+
+    for _ in 0..num_items {
+        // choose random spot for this item
+        let x = rand::thread_rng().gen_range(room.x1 + 1, room.x2);
+        let y = rand::thread_rng().gen_range(room.y1 + 1, room.y2);
+
+        // only place it if the tile is not blocked
+        if !is_blocked(x, y, map, entities) {
+            // create a healing potion
+            let mut Entity = Entity::new(x, y, '!', "healing potion", VIOLET, false);
+            Entity.item = Some(Item::Heal);
+            entities.push(Entity);
+        }
+    }
+}
+
+fn render_bar(
+    panel: &mut Offscreen,
+    x: i32,
+    y: i32,
+    total_width: i32,
+    name: &str,
+    value: i32,
+    maximum: i32,
+    bar_color: Color,
+    back_color: Color,
+) {
+    // render a bar (HP, experience, etc). First calculate the width of the bar
+    let bar_width = (value as f32 / maximum as f32 * total_width as f32) as i32;
+
+    // render the background first
+    panel.set_default_background(back_color);
+    panel.rect(x, y, total_width, 1, false, BackgroundFlag::Screen);
+
+    // now render the bar on top
+    panel.set_default_background(bar_color);
+    if bar_width > 0 {
+        panel.rect(x, y, bar_width, 1, false, BackgroundFlag::Screen);
+    }
+
+    // finally, some centered text with the values
+    panel.set_default_foreground(WHITE);
+    panel.print_ex(
+        x + total_width / 2,
+        y,
+        BackgroundFlag::None,
+        TextAlignment::Center,
+        &format!("{}: {}/{}", name, value, maximum),
+    );
+}
+
+/// return a string with the names of all entities under the mouse
+fn get_names_under_mouse(mouse: Mouse, entities: &[Entity], fov_map: &FovMap) -> String {
+    let (x, y) = (mouse.cx as i32, mouse.cy as i32);
+
+    // create a list with the names of all entities at the mouse's coordinates and in FOV
+    let names = entities
+        .iter()
+        .filter(|obj| obj.pos() == (x, y) && fov_map.is_in_fov(obj.x, obj.y))
+        .map(|obj| obj.name.clone())
+        .collect::<Vec<_>>();
+
+    names.join(", ") // join the names, separated by commas
+}
+
+fn render_all(tcod: &mut Tcod, game: &mut Game, entities: &[Entity], fov_recompute: bool) {
     if fov_recompute {
         // recompute FOV if needed (the player moved or something)
-        let player = &entities[0];
+        let player = &entities[PLAYER];
         tcod.fov
             .compute_fov(player.x, player.y, TORCH_RADIUS, FOV_LIGHT_WALLS, FOV_ALGO);
     }
-    
+
     // go through all tiles, and set their background color
     for y in 0..MAP_HEIGHT {
         for x in 0..MAP_WIDTH {
@@ -331,16 +652,18 @@ fn render_all(tcod: &mut Tcod, game: &mut Game, entities: &[Entity], fov_recompu
                 tcod.con
                     .set_char_background(x, y, color, BackgroundFlag::Set);
             }
-            tcod.con
-                .set_char_background(x, y, color, BackgroundFlag::Set);
         }
     }
 
-    // draw all objects in the list
-    for entity in entities {
-        if tcod.fov.is_in_fov(entity.x, entity.y) {
-            entity.draw(&mut tcod.con);
-        }
+    let mut to_draw: Vec<_> = entities
+        .iter()
+        .filter(|o| tcod.fov.is_in_fov(o.x, o.y))
+        .collect();
+    // sort so that non-blocking entities come first
+    to_draw.sort_by(|o1, o2| o1.blocks.cmp(&o2.blocks));
+    // draw the entities in the list
+    for Entity in &to_draw {
+        Entity.draw(&mut tcod.con);
     }
 
     // blit the contents of "con" to the root console
@@ -353,27 +676,348 @@ fn render_all(tcod: &mut Tcod, game: &mut Game, entities: &[Entity], fov_recompu
         1.0,
         1.0,
     );
+
+    // prepare to render the GUI panel
+    tcod.panel.set_default_background(BLACK);
+    tcod.panel.clear();
+
+    // print the game messages, one line at a time
+    let mut y = MSG_HEIGHT as i32;
+    for &(ref msg, color) in game.messages.iter().rev() {
+        let msg_height = tcod.panel.get_height_rect(MSG_X, y, MSG_WIDTH, 0, msg);
+        y -= msg_height;
+        if y < 0 {
+            break;
+        }
+        tcod.panel.set_default_foreground(color);
+        tcod.panel.print_rect(MSG_X, y, MSG_WIDTH, 0, msg);
+    }
+
+    // show the player's stats
+    let hp = entities[PLAYER].fighter.map_or(0, |f| f.hp);
+    let max_hp = entities[PLAYER].fighter.map_or(0, |f| f.max_hp);
+    render_bar(
+        &mut tcod.panel,
+        1,
+        1,
+        BAR_WIDTH,
+        "HP",
+        hp,
+        max_hp,
+        LIGHT_RED,
+        DARKER_RED,
+    );
+
+    // display names of entities under the mouse
+    tcod.panel.set_default_foreground(LIGHT_GREY);
+    tcod.panel.print_ex(
+        1,
+        0,
+        BackgroundFlag::None,
+        TextAlignment::Left,
+        get_names_under_mouse(tcod.mouse, entities, &tcod.fov),
+    );
+
+    // blit the contents of `panel` to the root console
+    blit(
+        &tcod.panel,
+        (0, 0),
+        (SCREEN_WIDTH, PANEL_HEIGHT),
+        &mut tcod.root,
+        (0, PANEL_Y),
+        1.0,
+        1.0,
+    );
 }
 
-fn create_room(room: Rect, map: &mut Map) {
-    // go through the tiles in the rectangle and make them passable
-    for x in (room.x1 + 1)..room.x2 { // including start, not including end
-        for y in (room.y1 + 1)..room.y2 {
-            map[x as usize][y as usize] = Tile::empty();
+fn player_move_or_attack(dx: i32, dy: i32, game: &mut Game, entities: &mut [Entity]) {
+    // the coordinates the player is moving to/attacking
+    let x = entities[PLAYER].x + dx;
+    let y = entities[PLAYER].y + dy;
+
+    // try to find an attackable Entity there
+    let target_id = entities
+        .iter()
+        .position(|Entity| Entity.fighter.is_some() && Entity.pos() == (x, y));
+
+    // attack if target found, move otherwise
+    match target_id {
+        Some(target_id) => {
+            let (player, target) = mut_two(PLAYER, target_id, entities);
+            player.attack(target, game);
+        }
+        None => {
+            move_by(PLAYER, dx, dy, &game.map, entities);
         }
     }
 }
 
-fn create_h_tunnel(x1: i32, x2: i32, y: i32, map: &mut Map) {
-    // horizontal tunnel. `min()` and `max()` are used in case `x1 > x2`
-    for x in cmp::min(x1, x2)..(cmp::max(x1, x2) + 1) {
-        map[x as usize][y as usize] = Tile::empty();
+fn menu<T: AsRef<str>>(header: &str, options: &[T], width: i32, root: &mut Root) -> Option<usize> {
+    assert!(
+        options.len() <= 26,
+        "Cannot have a menu with more than 26 options."
+    );
+
+    // calculate total height for the header (after auto-wrap) and one line per option
+    let header_height = root.get_height_rect(0, 0, width, SCREEN_HEIGHT, header);
+    let height = options.len() as i32 + header_height;
+
+    // create an off-screen console that represents the menu's window
+    let mut window = Offscreen::new(width, height);
+
+    // print the header, with auto-wrap
+    window.set_default_foreground(WHITE);
+    window.print_rect_ex(
+        0,
+        0,
+        width,
+        height,
+        BackgroundFlag::None,
+        TextAlignment::Left,
+        header,
+    );
+
+    // print all the options
+    for (index, option_text) in options.iter().enumerate() {
+        let menu_letter = (b'a' + index as u8) as char;
+        let text = format!("({}) {}", menu_letter, option_text.as_ref());
+        window.print_ex(
+            0,
+            header_height + index as i32,
+            BackgroundFlag::None,
+            TextAlignment::Left,
+            text,
+        );
+    }
+
+    // blit the contents of "window" to the root console
+    let x = SCREEN_WIDTH / 2 - width / 2;
+    let y = SCREEN_HEIGHT / 2 - height / 2;
+    blit(&window, (0, 0), (width, height), root, (x, y), 1.0, 0.7);
+
+    // present the root console to the player and wait for a key-press
+    root.flush();
+    let key = root.wait_for_keypress(true);
+
+    // convert the ASCII code to an index; if it corresponds to an option, return it
+    if key.printable.is_alphabetic() {
+        let index = key.printable.to_ascii_lowercase() as usize - 'a' as usize;
+        if index < options.len() {
+            Some(index)
+        } else {
+            None
+        }
+    } else {
+        None
     }
 }
 
-fn create_v_tunnel(y1: i32, y2: i32, x: i32, map: &mut Map) {
-    // vertical tunnel
-    for y in cmp::min(y1, y2)..(cmp::max(y1, y2) + 1) {
-        map[x as usize][y as usize] = Tile::empty();
+fn inventory_menu(inventory: &[Entity], header: &str, root: &mut Root) -> Option<usize> {
+    // how a menu with each item of the inventory as an option
+    let options = if inventory.len() == 0 {
+        vec!["Inventory is empty.".into()]
+    } else {
+        inventory.iter().map(|item| item.name.clone()).collect()
+    };
+
+    let inventory_index = menu(header, &options, INVENTORY_WIDTH, root);
+
+    // if an item was chosen, return it
+    if inventory.len() > 0 {
+        inventory_index
+    } else {
+        None
+    }
+}
+
+fn handle_keys(tcod: &mut Tcod, game: &mut Game, entities: &mut Vec<Entity>) -> PlayerAction {
+    use tcod::input::KeyCode::*;
+    use PlayerAction::*;
+
+    let player_alive = entities[PLAYER].alive;
+    match (tcod.key, tcod.key.text(), player_alive) {
+        (
+            Key {
+                code: Enter,
+                alt: true,
+                ..
+            },
+            _,
+            _,
+        ) => {
+            // Alt+Enter: toggle fullscreen
+            let fullscreen = tcod.root.is_fullscreen();
+            tcod.root.set_fullscreen(!fullscreen);
+            DidntTakeTurn
+        }
+        (Key { code: Escape, .. }, _, _) => Exit, // exit game
+
+        // movement keys
+        (Key { code: Up, .. }, _, true) => {
+            player_move_or_attack(0, -1, game, entities);
+            TookTurn
+        }
+        (Key { code: Down, .. }, _, true) => {
+            player_move_or_attack(0, 1, game, entities);
+            TookTurn
+        }
+        (Key { code: Left, .. }, _, true) => {
+            player_move_or_attack(-1, 0, game, entities);
+            TookTurn
+        }
+        (Key { code: Right, .. }, _, true) => {
+            player_move_or_attack(1, 0, game, entities);
+            TookTurn
+        }
+
+        (Key { code: Text, .. }, "g", true) => {
+            // pick up an item
+            let item_id = entities
+                .iter()
+                .position(|Entity| Entity.pos() == entities[PLAYER].pos() && Entity.item.is_some());
+            if let Some(item_id) = item_id {
+                pick_item_up(item_id, game, entities);
+            }
+            DidntTakeTurn
+        }
+
+        (Key { code: Text, .. }, "i", true) => {
+            // show the inventory: if an item is selected, use it
+            let inventory_index = inventory_menu(
+                &game.inventory,
+                "Press the key next to an item to use it, or any other to cancel.\n",
+                &mut tcod.root,
+            );
+            if let Some(inventory_index) = inventory_index {
+                use_item(inventory_index, tcod, game, entities);
+            }
+            DidntTakeTurn
+        }
+
+        _ => DidntTakeTurn,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PlayerAction {
+    TookTurn,
+    DidntTakeTurn,
+    Exit,
+}
+
+fn player_death(player: &mut Entity, game: &mut Game) {
+    // the game ended!
+    game.messages.add("You died!", RED);
+
+    // for added effect, transform the player into a corpse!
+    player.char = '%';
+    player.color = DARK_RED;
+}
+
+fn monster_death(monster: &mut Entity, game: &mut Game) {
+    // transform it into a nasty corpse! it doesn't block, can't be
+    // attacked and doesn't move
+    game.messages
+        .add(format!("{} is dead!", monster.name), ORANGE);
+    monster.char = '%';
+    monster.color = DARK_RED;
+    monster.blocks = false;
+    monster.fighter = None;
+    monster.ai = None;
+    monster.name = format!("remains of {}", monster.name);
+}
+
+fn main() {
+    tcod::system::set_fps(LIMIT_FPS);
+
+    let root = Root::initializer()
+        .font("arial10x10.png", FontLayout::Tcod)
+        .font_type(FontType::Greyscale)
+        .size(SCREEN_WIDTH, SCREEN_HEIGHT)
+        .title("Rust/libtcod tutorial")
+        .init();
+
+    let mut tcod = Tcod {
+        root,
+        con: Offscreen::new(MAP_WIDTH, MAP_HEIGHT),
+        panel: Offscreen::new(SCREEN_WIDTH, PANEL_HEIGHT),
+        fov: FovMap::new(MAP_WIDTH, MAP_HEIGHT),
+        key: Default::default(),
+        mouse: Default::default(),
+    };
+
+    // create Entity representing the player
+    let mut player = Entity::new(0, 0, '@', "player", WHITE, true);
+    player.alive = true;
+    player.fighter = Some(Fighter {
+        max_hp: 30,
+        hp: 30,
+        defense: 2,
+        power: 5,
+        on_death: DeathCallback::Player,
+    });
+
+    // the list of entities with just the player
+    let mut entities = vec![player];
+
+    let mut game = Game {
+        // generate map (at this point it's not drawn to the screen)
+        map: make_map(&mut entities),
+        messages: Messages::new(),
+        inventory: vec![],
+    };
+
+    // populate the FOV map, according to the generated map
+    for y in 0..MAP_HEIGHT {
+        for x in 0..MAP_WIDTH {
+            tcod.fov.set(
+                x,
+                y,
+                !game.map[x as usize][y as usize].block_sight,
+                !game.map[x as usize][y as usize].blocked,
+            );
+        }
+    }
+
+    // a warm welcoming message!
+    game.messages.add(
+        "Welcome stranger! Prepare to perish in the Tombs of the Ancient Kings.",
+        RED,
+    );
+
+    // force FOV "recompute" first time through the game loop
+    let mut previous_player_position = (-1, -1);
+
+    while !tcod.root.window_closed() {
+        // clear the screen of the previous frame
+        tcod.con.clear();
+
+        match input::check_for_event(input::MOUSE | input::KEY_PRESS) {
+            Some((_, Event::Mouse(m))) => tcod.mouse = m,
+            Some((_, Event::Key(k))) => tcod.key = k,
+            _ => tcod.key = Default::default(),
+        }
+
+        // render the screen
+        let fov_recompute = previous_player_position != (entities[PLAYER].pos());
+        render_all(&mut tcod, &mut game, &entities, fov_recompute);
+
+        tcod.root.flush();
+
+        // handle keys and exit game if needed
+        previous_player_position = entities[PLAYER].pos();
+        let player_action = handle_keys(&mut tcod, &mut game, &mut entities);
+        if player_action == PlayerAction::Exit {
+            break;
+        }
+
+        // let monsters take their turn
+        if entities[PLAYER].alive && player_action != PlayerAction::DidntTakeTurn {
+            for id in 0..entities.len() {
+                if entities[id].ai.is_some() {
+                    ai_take_turn(id, &tcod, &mut game, &mut entities);
+                }
+            }
+        }
     }
 }
